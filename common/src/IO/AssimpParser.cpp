@@ -1,4 +1,5 @@
 /*
+ Copyright (C) 2023 Daniel Walder
  Copyright (C) 2022 Amara M. Kilic
  Copyright (C) 2022 Kristian Duske
 
@@ -22,7 +23,6 @@
 
 #include "Assets/EntityModel.h"
 #include "Assets/Texture.h"
-#include "Error.h"
 #include "IO/File.h"
 #include "IO/FileSystem.h"
 #include "IO/PathInfo.h"
@@ -31,29 +31,28 @@
 #include "Logger.h"
 #include "Model/BrushFaceAttributes.h"
 #include "ReaderException.h"
+#include "Renderer/IndexRangeMapBuilder.h"
 #include "Renderer/PrimType.h"
-#include "Renderer/TexturedIndexRangeMap.h"
-#include "Renderer/TexturedIndexRangeMapBuilder.h"
 
+#include "kdl/path_utils.h"
+#include "kdl/result.h"
 #include "kdl/result_fold.h"
-#include <kdl/path_utils.h>
-#include <kdl/result.h>
-#include <kdl/string_format.h>
-#include <kdl/vector_utils.h>
+#include "kdl/string_format.h"
+#include "kdl/vector_utils.h"
 
 #include <assimp/IOStream.hpp>
 #include <assimp/IOSystem.hpp>
 #include <assimp/Importer.hpp>
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
+#include <assimp/types.h>
+#include <fmt/format.h>
 
 #include <optional>
+#include <string_view>
 #include <utility>
-#include <vector>
 
-namespace TrenchBroom
-{
-namespace IO
+namespace TrenchBroom::IO
 {
 
 namespace
@@ -81,10 +80,7 @@ public:
       m_reader.read(reinterpret_cast<char*>(buffer), size * count);
       return count;
     }
-    else
-    {
-      return 0;
-    }
+    return 0;
   }
 
   size_t Write(
@@ -166,90 +162,619 @@ public:
   }
 };
 
-} // namespace
-
-std::unique_ptr<Assets::EntityModel> AssimpParser::doInitializeModel(
-  TrenchBroom::Logger& logger)
+std::optional<Assets::Texture> loadFallbackTexture(const FileSystem& fs)
 {
-  // Create model.
-  auto model = std::make_unique<Assets::EntityModel>(
-    m_path.string(), Assets::PitchType::Normal, Assets::Orientation::Oriented);
-  model->addFrame();
-  auto& surface = model->addSurface(m_path.string());
+  static const auto NoTextureName = Model::BrushFaceAttributes::NoTextureName;
 
-  m_positions.clear();
-  m_vertices.clear();
-  m_faces.clear();
-  m_textures.clear();
+  static const auto texturePaths = std::vector<std::filesystem::path>{
+    "textures" / kdl::path_add_extension(NoTextureName, ".png"),
+    "textures" / kdl::path_add_extension(NoTextureName, ".jpg"),
+    kdl::path_add_extension(NoTextureName, ".png"),
+    kdl::path_add_extension(NoTextureName, ".jpg"),
+  };
 
-  // Import the file as an Assimp scene and populate our vectors.
-  auto importer = Assimp::Importer{};
-  importer.SetIOHandler(new AssimpIOSystem{m_fs});
+  return kdl::select_first(texturePaths, [&](const auto& texturePath) {
+    return fs.openFile(texturePath).and_then([](auto file) {
+      auto reader = file->reader().buffer();
+      return readFreeImageTexture("", reader);
+    });
+  });
+}
 
-  const auto* scene = importer.ReadFile(
-    m_path.string(),
-    aiProcess_Triangulate | aiProcess_JoinIdenticalVertices | aiProcess_FlipWindingOrder
-      | aiProcess_SortByPType | aiProcess_FlipUVs);
-
-  if (!scene)
+Assets::Texture loadFallbackOrDefaultTexture(
+  const FileSystem& fs, const std::string& defaultMaterialName, Logger& logger)
+{
+  if (auto fallbackTexture = loadFallbackTexture(fs))
   {
-    throw ParserException{
-      std::string{"Assimp couldn't import the file: "} + importer.GetErrorString()};
+    return {std::move(*fallbackTexture)};
+  }
+  return {loadDefaultTexture(fs, defaultMaterialName, logger)};
+}
+
+Assets::Texture loadTextureFromFileSystem(
+  const std::filesystem::path& path, const FileSystem& fs, Logger& logger)
+{
+  return fs.openFile(path)
+    .and_then([](auto file) {
+      auto reader = file->reader().buffer();
+      return readFreeImageTexture("", reader);
+    })
+    .or_else(makeReadTextureErrorHandler(fs, logger))
+    .value();
+}
+
+Assets::Texture loadUncompressedEmbeddedTexture(
+  std::string name, const aiTexel& data, const size_t width, const size_t height)
+{
+  auto buffer = Assets::TextureBuffer{width * height * sizeof(aiTexel)};
+  std::memcpy(buffer.data(), &data, width * height * sizeof(aiTexel));
+
+  const auto averageColor = getAverageColor(buffer, GL_BGRA);
+  return {
+    std::move(name),
+    width,
+    height,
+    averageColor,
+    std::move(buffer),
+    GL_BGRA,
+    Assets::TextureType::Masked};
+}
+
+Assets::Texture loadCompressedEmbeddedTexture(
+  std::string name,
+  const aiTexel& data,
+  const size_t size,
+  const FileSystem& fs,
+  Logger& logger)
+{
+  return readFreeImageTextureFromMemory(
+           std::move(name), reinterpret_cast<const uint8_t*>(&data), size)
+    .or_else(makeReadTextureErrorHandler(fs, logger))
+    .value();
+}
+
+Assets::Texture loadTexture(
+  const aiTexture* texture,
+  const std::filesystem::path& texturePath,
+  const std::filesystem::path& modelPath,
+  const FileSystem& fs,
+  Logger& logger)
+{
+  if (!texture)
+  {
+    // The texture is not embedded. Load it using the file system.
+    const auto filePath = modelPath.parent_path() / texturePath;
+    return loadTextureFromFileSystem(filePath, fs, logger);
   }
 
-  // Load materials as textures.
-  processMaterials(*scene, logger);
-
-  surface.setSkins(std::move(m_textures));
-
-  // Assimp files import as y-up. We must multiply the root transform with an axis
-  // transform matrix.
-  processNode(
-    *scene->mRootNode,
-    *scene,
-    scene->mRootNode->mTransformation,
-    get_axis_transform(*scene));
-
-  // Build bounds.
-  auto bounds = vm::bbox3f::builder{};
-  if (m_positions.empty())
+  if (texture->mHeight != 0)
   {
-    // Passing empty bounds as bbox crashes the program, don't let it happen.
-    throw ParserException{"Model has no vertices. (So no valid bounding box.)"};
+    // The texture is uncompressed, load it directly.
+    return loadUncompressedEmbeddedTexture(
+      texture->mFilename.C_Str(), *texture->pcData, texture->mWidth, texture->mHeight);
+  }
+
+  // The texture is embedded, but compressed. Let FreeImage load it from memory.
+  return loadCompressedEmbeddedTexture(
+    texture->mFilename.C_Str(), *texture->pcData, texture->mWidth, fs, logger);
+}
+
+std::vector<Assets::Texture> loadTexturesForMaterial(
+  const aiScene& scene,
+  const size_t materialIndex,
+  const std::filesystem::path& modelPath,
+  const FileSystem& fs,
+  Logger& logger)
+{
+  auto textures = std::vector<Assets::Texture>{};
+
+  // Is there even a single diffuse texture? If not, fail and load fallback material.
+  const auto textureCount =
+    scene.mMaterials[materialIndex]->GetTextureCount(aiTextureType_DIFFUSE);
+  if (textureCount > 0)
+  {
+    // load up every diffuse texture
+    for (unsigned int ti = 0; ti < textureCount; ++ti)
+    {
+      auto path = aiString{};
+      scene.mMaterials[materialIndex]->GetTexture(aiTextureType_DIFFUSE, ti, &path);
+
+      const auto texturePath = std::filesystem::path{path.C_Str()};
+      const auto* texture = scene.GetEmbeddedTexture(path.C_Str());
+      textures.push_back(loadTexture(texture, texturePath, modelPath, fs, logger));
+    }
   }
   else
   {
-    bounds.add(std::begin(m_positions), std::end(m_positions));
+    logger.error(fmt::format(
+      "No diffuse textures found for material {} of model '{}', loading fallback texture",
+      materialIndex,
+      modelPath.string()));
+
+    // Materials aren't guaranteed to have a name.
+    const auto materialName = scene.mMaterials[materialIndex]->GetName() != aiString{""}
+                                ? scene.mMaterials[materialIndex]->GetName().C_Str()
+                                : "nr. " + std::to_string(materialIndex + 1);
+    textures.push_back(loadFallbackOrDefaultTexture(fs, materialName, logger));
   }
 
-  // Begin model construction.
-  // Part 1: Collation
-  size_t totalVertexCount = 0;
-  auto size = Renderer::TexturedIndexRangeMap::Size{};
-  for (const auto& face : m_faces)
-  {
-    size.inc(
-      surface.skin(face.m_material), Renderer::PrimType::Polygon, face.m_vertices.size());
-    totalVertexCount += face.m_vertices.size();
-  }
-
-  // Part 2: Building
-  auto& frame = model->loadFrame(0, m_path.string(), bounds.bounds());
-  auto builder = Renderer::TexturedIndexRangeMapBuilder<Assets::EntityModelVertex::Type>{
-    totalVertexCount, size};
-
-  for (const auto& face : m_faces)
-  {
-    auto entityVertices = kdl::vec_transform(face.m_vertices, [&](const auto& index) {
-      return Assets::EntityModelVertex{
-        m_positions[m_vertices[index].m_position], m_vertices[index].m_texcoords};
-    });
-    builder.addPolygon(surface.skin(face.m_material), entityVertices);
-  }
-
-  surface.addTexturedMesh(frame, builder.vertices(), builder.indices());
-  return model;
+  return textures;
 }
+
+struct AssimpComputedMeshData
+{
+  size_t m_meshIndex;
+  std::vector<Assets::EntityModelVertex> m_vertices;
+  Assets::EntityModelIndices m_indices;
+};
+
+struct AssimpBoneInformation
+{
+  size_t m_boneIndex;
+  int32_t m_parentIndex;
+  aiString m_name;
+  aiMatrix4x4 m_localTransform;
+  aiMatrix4x4 m_globalTransform;
+};
+
+struct AssimpVertexBoneWeight
+{
+  size_t m_boneIndex;
+  float m_weight;
+  const aiBone& m_bone;
+};
+
+/**
+ * Gets the index for a particular assimp mesh.
+ * Assimp meshes do not have unique names so we match by reference.
+ */
+std::optional<size_t> getMeshIndex(const aiScene& scene, const aiMesh& mesh)
+{
+  for (unsigned int i = 0; i < scene.mNumMeshes; ++i)
+  {
+    if (&mesh == scene.mMeshes[i])
+    {
+      return size_t(i);
+    }
+  }
+  return std::nullopt;
+}
+
+/**
+ * Gets the channel index for a particular assimp node, matched by name.
+ */
+std::optional<size_t> getChannelIndex(const aiAnimation& animation, const aiNode& node)
+{
+  const auto nodeName = std::string_view{node.mName.data};
+  for (unsigned int i = 0; i < animation.mNumChannels; ++i)
+  {
+    const auto channelName = std::string_view{animation.mChannels[i]->mNodeName.data};
+    if (channelName == nodeName)
+    {
+      return size_t(i);
+    }
+  }
+  return std::nullopt;
+}
+
+/**
+ * Gets the parent bone's channel index as well as its transformation,
+ * recursively multiplied by all bones further up the hierarchy.
+ */
+std::tuple<size_t, aiMatrix4x4> getBoneParentChannelAndTransformation(
+  const aiAnimation& animation,
+  const aiNode& boneNode,
+  const std::vector<aiMatrix4x4>& channelTransforms)
+{
+  const auto* parentNode = boneNode.mParent;
+  if (!parentNode)
+  {
+    // reached the root node
+    return {-1, aiMatrix4x4{}};
+  }
+
+  if (const auto index = getChannelIndex(animation, *parentNode))
+  {
+    // we have found the index of this bone in the channel list
+    const auto [parentIndex, parentTransform] =
+      getBoneParentChannelAndTransformation(animation, *parentNode, channelTransforms);
+    unused(parentIndex);
+
+    return {*index, parentTransform * channelTransforms[*index]};
+  }
+
+  // this node is not a bone, use the node's default transformation
+  return {-1, parentNode->mTransformation};
+}
+
+/**
+ * Computes the animation information for each channel in an
+ * animation sequence. Always uses the first frame of the animation.
+ */
+std::vector<AssimpBoneInformation> getAnimationInformation(
+  const aiNode& root, const aiAnimation& animation)
+{
+  auto indivTransforms = std::vector<aiMatrix4x4>{};
+  indivTransforms.reserve(animation.mNumChannels);
+
+  // calculate the transformations for each animation channel
+  for (unsigned int i = 0; i < animation.mNumChannels; ++i)
+  {
+    const auto& channel = *animation.mChannels[i];
+
+    const auto position = channel.mNumPositionKeys > 0 ? channel.mPositionKeys[0].mValue
+                                                       : aiVector3D{0, 0, 0};
+    const auto rotation = channel.mNumRotationKeys > 0 ? channel.mRotationKeys[0].mValue
+                                                       : aiQuaternion{1, 0, 0, 0};
+    const auto scale =
+      channel.mNumScalingKeys > 0 ? channel.mScalingKeys[0].mValue : aiVector3D{1, 1, 1};
+
+    // build a transformation matrix from it
+    auto mat = aiMatrix4x4{rotation.GetMatrix()};
+    mat.a1 *= scale.x;
+    mat.b1 *= scale.x;
+    mat.c1 *= scale.x;
+    mat.a2 *= scale.y;
+    mat.b2 *= scale.y;
+    mat.c2 *= scale.y;
+    mat.a3 *= scale.z;
+    mat.b3 *= scale.z;
+    mat.c3 *= scale.z;
+    mat.a4 = position.x;
+    mat.b4 = position.y;
+    mat.c4 = position.z;
+
+    indivTransforms.push_back(std::move(mat));
+  }
+
+  // assemble the transform information from the bone hierarchy (child
+  // bones must be multiplied by their parent transformations, recursively)
+  auto transforms = std::vector<AssimpBoneInformation>{};
+  transforms.reserve(animation.mNumChannels);
+
+  for (unsigned int i = 0; i < animation.mNumChannels; ++i)
+  {
+    const auto& channel = *animation.mChannels[i];
+
+    // traverse the bone hierarchy to compute the global transformation
+    if (const auto* boneNode = root.FindNode(channel.mNodeName))
+    {
+      const auto [parentId, parentTransform] =
+        getBoneParentChannelAndTransformation(animation, *boneNode, indivTransforms);
+
+      transforms.push_back(
+        {i,
+         int32_t(parentId),
+         channel.mNodeName,
+         indivTransforms[i],
+         parentTransform * indivTransforms[i]});
+    }
+    else
+    {
+      // couldn't find the bone node, something is weird
+      transforms.emplace_back();
+    }
+  }
+
+  return transforms;
+}
+
+void processNode(
+  std::vector<AssimpMeshWithTransforms>& meshes,
+  const aiNode& node,
+  const aiScene& scene,
+  const aiMatrix4x4& transform,
+  const aiMatrix4x4& axisTransform)
+{
+  for (unsigned int i = 0; i < node.mNumMeshes; ++i)
+  {
+    const auto* mesh = scene.mMeshes[node.mMeshes[i]];
+    meshes.push_back({mesh, transform, axisTransform});
+  }
+
+  for (unsigned int i = 0; i < node.mNumChildren; ++i)
+  {
+    processNode(
+      meshes,
+      *node.mChildren[i],
+      scene,
+      transform * node.mChildren[i]->mTransformation,
+      axisTransform);
+  }
+}
+
+const auto AiMdlHl1NodeBodyparts = "<MDL_bodyparts>";
+
+void processRootNode(
+  std::vector<AssimpMeshWithTransforms>& meshes,
+  const aiNode& node,
+  const aiScene& scene,
+  const aiMatrix4x4& transform,
+  const aiMatrix4x4& axisTransform)
+{
+  // HL1 models have a slightly different structure than normal, the format consists
+  // of multiple body parts, and each body part has one or more submodels. Only one
+  // submodel per body part should be rendered at a time.
+
+  // See if we have loaded a HL1 model
+  if (const auto hl1BodyParts = node.FindNode(AiMdlHl1NodeBodyparts))
+  {
+    // HL models are loaded by assimp in a particular way, each bodypart and all
+    // its submodels are loaded into different nodes in the scene. To properly
+    // display the model, we must choose EXACTLY ONE submodel from each body
+    // part and render the meshes for those chosen submodels.
+
+    // Assimp HL models face sideways by default so spin by -90 on the z axis
+    // this MIGHT be needed for non-HL models as well. To be safe for now, we
+    // only do this for HL models.
+    const auto rotation = aiQuaternion{aiVector3t{0, 1, 0}, -vm::Cf::half_pi()};
+    const auto rotMatrix = aiMatrix4x4{rotation.GetMatrix()};
+    const auto newAxisTransform = axisTransform * rotMatrix;
+
+    // loop through each body part
+    for (unsigned int i = 0; i < hl1BodyParts->mNumChildren; ++i)
+    {
+      const auto& bodypart = *hl1BodyParts->mChildren[i];
+      if (bodypart.mNumChildren > 0)
+      {
+        // currently we don't have a way to know which submodel the user
+        // might want to see, so just use the first one.
+        processNode(meshes, *bodypart.mChildren[0], scene, transform, newAxisTransform);
+      }
+    }
+  }
+  else
+  {
+    // not a HL1 model, just process like normal
+    processNode(meshes, node, scene, transform, axisTransform);
+  }
+}
+
+std::optional<size_t> getBoneIndexByName(
+  const std::vector<AssimpBoneInformation>& boneTransforms, const aiBone& bone)
+{
+  const auto boneName = std::string_view{bone.mName.data};
+  for (size_t i = 0; i < boneTransforms.size(); ++i)
+  {
+    const auto boneTransformName = std::string_view{boneTransforms[i].m_name.data};
+    if (boneTransformName == boneName)
+    {
+      return i;
+    }
+  }
+  return std::nullopt;
+}
+
+std::vector<Assets::EntityModelVertex> computeMeshVertices(
+  const aiMesh& mesh,
+  const aiMatrix4x4& transform,
+  const aiMatrix4x4& axisTransform,
+  const std::vector<AssimpBoneInformation>& boneTransforms)
+{
+  auto vertices = std::vector<Assets::EntityModelVertex>{};
+
+  // We pass through the aiProcess_Triangulate flag to assimp, so we know for sure we'll
+  // ONLY get triangles in a single mesh. This is just a safety net to make sure we don't
+  // do anything bad.
+  if (!(mesh.mPrimitiveTypes & aiPrimitiveType_TRIANGLE))
+  {
+    return vertices;
+  }
+
+  // the weights for each vertex are stored in the bones, not in
+  // the vertices. this loop lets us collect the bone weightings
+  // per vertex so we can process them.
+  auto weightsPerVertex =
+    std::vector<std::vector<AssimpVertexBoneWeight>>{mesh.mNumVertices};
+  for (unsigned int i = 0; i < mesh.mNumBones; ++i)
+  {
+    const auto& bone = *mesh.mBones[i];
+
+    // find the bone with the matching name
+    if (const auto index = getBoneIndexByName(boneTransforms, bone))
+    {
+      for (unsigned int j = 0; j < bone.mNumWeights; ++j)
+      {
+        weightsPerVertex[bone.mWeights[j].mVertexId].push_back(
+          {*index, bone.mWeights[j].mWeight, bone});
+      }
+    }
+  }
+
+  const auto numVerts = mesh.mNumVertices;
+  vertices.reserve(numVerts);
+
+  // Add all the vertices of the mesh.
+  for (unsigned int i = 0; i < numVerts; ++i)
+  {
+    const auto texcoords =
+      mesh.mTextureCoords[0]
+        ? vm::vec2f{mesh.mTextureCoords[0][i].x, mesh.mTextureCoords[0][i].y}
+        : vm::vec2f{0.0f, 0.0f};
+
+    auto meshVertices = mesh.mVertices[i];
+
+    // Bone indices and weights
+    if (mesh.HasBones() && !boneTransforms.empty() && !weightsPerVertex[i].empty())
+    {
+      const auto vertWeights = weightsPerVertex[i];
+      auto vertPos = aiVector3D{};
+
+      for (const auto& vertWeight : vertWeights)
+      {
+        const auto boneIndex = vertWeight.m_boneIndex;
+        const auto weight = vertWeight.m_weight;
+        const auto& bone = vertWeight.m_bone;
+        if (boneIndex < boneTransforms.size())
+        {
+          const auto& boneTransform = boneTransforms[boneIndex];
+          auto weightedPosition = meshVertices;
+          weightedPosition *= bone.mOffsetMatrix;
+          weightedPosition *= boneTransform.m_globalTransform;
+          weightedPosition *= weight;
+          vertPos += weightedPosition;
+        }
+      }
+
+      meshVertices = vertPos;
+    }
+
+    meshVertices *= transform;
+    meshVertices *= axisTransform;
+
+    vertices.emplace_back(
+      vm::vec3f{meshVertices.x, meshVertices.y, meshVertices.z}, texcoords);
+  }
+
+  return vertices;
+}
+
+aiMatrix4x4 getAxisTransform(const aiScene& scene)
+{
+  if (scene.mMetaData)
+  {
+    // These MUST be in32_t, or the metadata 'Get' function will get confused.
+    int32_t upAxis = 0, frontAxis = 0, coordAxis = 0, upAxisSign = 0, frontAxisSign = 0,
+            coordAxisSign = 0;
+    auto unitScale = 1.0f;
+
+    const auto metadataPresent = scene.mMetaData->Get("UpAxis", upAxis)
+                                 && scene.mMetaData->Get("UpAxisSign", upAxisSign)
+                                 && scene.mMetaData->Get("FrontAxis", frontAxis)
+                                 && scene.mMetaData->Get("FrontAxisSign", frontAxisSign)
+                                 && scene.mMetaData->Get("CoordAxis", coordAxis)
+                                 && scene.mMetaData->Get("CoordAxisSign", coordAxisSign)
+                                 && scene.mMetaData->Get("UnitScaleFactor", unitScale);
+
+    if (!metadataPresent)
+    {
+      // By default, all 3D data from is provided in a right-handed coordinate system.
+      // +X to the right. -Z into the screen. +Y upwards.
+      upAxis = 1;
+      upAxisSign = 1;
+      frontAxis = 2;
+      frontAxisSign = 1;
+      coordAxis = 0;
+      coordAxisSign = 1;
+      unitScale = 1.0f;
+    }
+
+    auto up = aiVector3D{};
+    auto front = aiVector3D{};
+    auto coord = aiVector3D{};
+    up[static_cast<unsigned int>(upAxis)] = float(upAxisSign) * unitScale;
+    front[static_cast<unsigned int>(frontAxis)] = float(frontAxisSign) * unitScale;
+    coord[static_cast<unsigned int>(coordAxis)] = float(coordAxisSign) * unitScale;
+
+    return aiMatrix4x4t{
+      coord.x,
+      coord.y,
+      coord.z,
+      0.0f,
+      -front.x,
+      -front.y,
+      -front.z,
+      0.0f,
+      up.x,
+      up.y,
+      up.z,
+      0.0f,
+      0.0f,
+      0.0f,
+      0.0f,
+      1.0f};
+  }
+
+  return aiMatrix4x4{};
+}
+
+Result<void> loadSceneFrame(
+  const aiScene& scene,
+  const size_t frameIndex,
+  Assets::EntityModel& model,
+  const std::string& name)
+{
+  // load the animation information for the current "frame" (animation)
+  const auto boneTransforms =
+    frameIndex < scene.mNumAnimations
+      ? getAnimationInformation(*scene.mRootNode, *scene.mAnimations[frameIndex])
+      : std::vector<AssimpBoneInformation>{};
+
+  auto meshes = std::vector<AssimpMeshWithTransforms>{};
+
+  // Assimp files import as y-up. We must multiply the root transform with an axis
+  // transform matrix.
+  processRootNode(
+    meshes,
+    *scene.mRootNode,
+    scene,
+    scene.mRootNode->mTransformation,
+    getAxisTransform(scene));
+
+  // store the mesh data in a list so we can compute the bounding box before creating the
+  // frame
+  auto meshData = std::vector<AssimpComputedMeshData>{};
+  auto bounds = vm::bbox3f::builder{};
+
+  for (const auto& mesh : meshes)
+  {
+    if (const auto meshIndex = getMeshIndex(scene, *mesh.m_mesh))
+    {
+      const auto vertices = computeMeshVertices(
+        *mesh.m_mesh, mesh.m_transform, mesh.m_axisTransform, boneTransforms);
+
+      for (const auto& v : vertices)
+      {
+        bounds.add(v.attr);
+      }
+
+      // build the mesh faces as triangles
+      const auto numTriangles = mesh.m_mesh->mNumFaces;
+      const auto numIndices = numTriangles * 3;
+
+      auto size = Renderer::IndexRangeMap::Size{};
+      size.inc(Renderer::PrimType::Triangles, numTriangles);
+      auto builder =
+        Renderer::IndexRangeMapBuilder<Assets::EntityModelVertex::Type>{numIndices, size};
+
+      for (unsigned int i = 0; i < numTriangles; ++i)
+      {
+        const auto& face = mesh.m_mesh->mFaces[i];
+
+        // ignore anything that's not a triangle
+        if (face.mNumIndices == 3)
+        {
+          builder.addTriangle(
+            vertices[face.mIndices[0]],
+            vertices[face.mIndices[1]],
+            vertices[face.mIndices[2]]);
+        }
+      }
+
+      meshData.push_back({*meshIndex, builder.vertices(), builder.indices()});
+    }
+  }
+
+  if (!bounds.initialized())
+  {
+    // passing empty bounds as bbox crashes the program, don't let it happen
+    return Error{"Model has no vertices. (So no valid bounding box.)"};
+  }
+
+  // we've processed the model, now we can create the frame and bind the meshes to it
+  const auto frameBounds = bounds.bounds();
+  auto& frame = model.loadFrame(frameIndex, name, frameBounds);
+
+  for (const auto& data : meshData)
+  {
+    auto& surface = model.surface(data.m_meshIndex);
+    surface.addIndexedMesh(frame, data.m_vertices, data.m_indices);
+  }
+
+  return Result<void>{};
+}
+
+} // namespace
 
 AssimpParser::AssimpParser(std::filesystem::path path, const FileSystem& fs)
   : m_path{std::move(path)}
@@ -279,249 +804,86 @@ bool AssimpParser::canParse(const std::filesystem::path& path)
     supportedExtensions, kdl::str_to_lower(path.extension().string()));
 }
 
-void AssimpParser::processNode(
-  const aiNode& node,
-  const aiScene& scene,
-  const aiMatrix4x4& transform,
-  const aiMatrix4x4& axisTransform)
+std::unique_ptr<Assets::EntityModel> AssimpParser::doInitializeModel(
+  TrenchBroom::Logger& logger)
 {
-  for (unsigned int i = 0; i < node.mNumMeshes; i++)
+  constexpr auto assimpFlags = aiProcess_Triangulate | aiProcess_JoinIdenticalVertices
+                               | aiProcess_FlipWindingOrder | aiProcess_SortByPType
+                               | aiProcess_FlipUVs;
+
+  const auto modelPath = m_path.string();
+
+  // Import the file as an Assimp scene and populate our vectors.
+  auto importer = Assimp::Importer{};
+  importer.SetIOHandler(new AssimpIOSystem{m_fs});
+
+  const auto* scene = importer.ReadFile(modelPath, assimpFlags);
+  if (!scene)
   {
-    const auto* mesh = scene.mMeshes[node.mMeshes[i]];
-    processMesh(*mesh, transform, axisTransform);
+    throw ParserException{fmt::format(
+      "Assimp couldn't import model from '{}': {}",
+      m_path.string(),
+      importer.GetErrorString())};
   }
-  for (unsigned int i = 0; i < node.mNumChildren; i++)
+
+  // Create model.
+  auto model = std::make_unique<Assets::EntityModel>(
+    modelPath, Assets::PitchType::Normal, Assets::Orientation::Oriented);
+
+  // create a frame for each animation in the scene
+  // if we have no animations, always load 1 frame for the reference model
+  const auto numSequences = std::max(scene->mNumAnimations, 1u);
+  for (size_t i = 0; i < numSequences; ++i)
   {
-    processNode(
-      *node.mChildren[i],
-      scene,
-      transform * node.mChildren[i]->mTransformation,
-      axisTransform);
+    model->addFrame();
   }
-}
 
-void AssimpParser::processMesh(
-  const aiMesh& mesh, const aiMatrix4x4& transform, const aiMatrix4x4& axisTransform)
-{
-  // Meshes have been sorted by primitive type, so we know for sure we'll ONLY get
-  // triangles in a single mesh.
-  if (mesh.mPrimitiveTypes & aiPrimitiveType_TRIANGLE)
+  // create a surface for each mesh in the scene and assign the skins/materials to it
+  const auto numMeshes = scene->mNumMeshes;
+  for (size_t i = 0; i < numMeshes; ++i)
   {
-    const auto offset = m_vertices.size();
-    // Add all the vertices of the mesh.
-    for (unsigned int i = 0; i < mesh.mNumVertices; i++)
-    {
-      const auto texcoords =
-        mesh.mTextureCoords[0]
-          ? vm::vec2f{mesh.mTextureCoords[0][i].x, mesh.mTextureCoords[0][i].y}
-          : vm::vec2f{0.0f, 0.0f};
+    const auto& mesh = scene->mMeshes[i];
 
-      m_vertices.emplace_back(m_positions.size(), texcoords);
+    auto& surface = model->addSurface(scene->mMeshes[i]->mName.data);
 
-      auto meshVertices = mesh.mVertices[i];
-      meshVertices *= transform;
-      meshVertices *= axisTransform;
-      m_positions.emplace_back(meshVertices.x, meshVertices.y, meshVertices.z);
-    }
+    // an assimp mesh will only ever have one material, but a material can have multiple
+    // alternatives (this is how assimp handles skins)
 
-    for (unsigned int i = 0; i < mesh.mNumFaces; i++)
-    {
-      auto verts = std::vector<size_t>{};
-      verts.reserve(mesh.mFaces[i].mNumIndices);
-
-      for (unsigned int j = 0; j < mesh.mFaces[i].mNumIndices; j++)
-      {
-        verts.push_back(mesh.mFaces[i].mIndices[j] + offset);
-      }
-      m_faces.emplace_back(mesh.mMaterialIndex, verts);
-    }
+    // load skins for this surface
+    surface.setSkins(
+      {loadTexturesForMaterial(*scene, mesh->mMaterialIndex, m_path, m_fs, logger)});
   }
+
+  return model;
 }
 
-namespace
+void AssimpParser::doLoadFrame(
+  size_t frameIndex, Assets::EntityModel& model, Logger& /* logger */)
 {
+  constexpr auto assimpFlags = aiProcess_Triangulate | aiProcess_JoinIdenticalVertices
+                               | aiProcess_FlipWindingOrder | aiProcess_SortByPType
+                               | aiProcess_FlipUVs;
 
-Assets::Texture loadTextureFromFileSystem(
-  const std::filesystem::path& path, const FileSystem& fs, Logger& logger)
-{
-  return fs.openFile(path)
-    .and_then([](auto file) {
-      auto reader = file->reader().buffer();
-      return readFreeImageTexture("", reader);
-    })
-    .or_else(makeReadTextureErrorHandler(fs, logger))
-    .value();
-}
+  const auto modelPath = m_path.string();
 
-Assets::Texture loadUncompressedEmbeddedTexture(
-  const aiTexel* data, std::string name, const size_t width, const size_t height)
-{
-  auto buffer = Assets::TextureBuffer{width * height * sizeof(aiTexel)};
-  std::memcpy(buffer.data(), data, width * height * sizeof(aiTexel));
+  // Import the file as an Assimp scene and populate our vectors.
+  auto importer = Assimp::Importer{};
+  importer.SetIOHandler(new AssimpIOSystem{m_fs});
 
-  const auto averageColor = getAverageColor(buffer, GL_BGRA);
-  return {
-    std::move(name),
-    width,
-    height,
-    averageColor,
-    std::move(buffer),
-    GL_BGRA,
-    Assets::TextureType::Masked};
-}
+  const auto* scene = importer.ReadFile(modelPath, assimpFlags);
+  if (!scene)
+  {
+    throw ParserException{fmt::format(
+      "Assimp couldn't import model from '{}': {}",
+      m_path.string(),
+      importer.GetErrorString())};
+  }
 
-Assets::Texture loadCompressedEmbeddedTexture(
-  std::string name,
-  const aiTexel* data,
-  const size_t size,
-  const FileSystem& fs,
-  Logger& logger)
-{
-  return readFreeImageTextureFromMemory(
-           name, reinterpret_cast<const uint8_t*>(data), size)
-    .or_else(makeReadTextureErrorHandler(fs, logger))
-    .value();
-}
-
-std::optional<Assets::Texture> loadFallbackTexture(const FileSystem& fs)
-{
-  static const auto texturePaths = std::vector<std::filesystem::path>{
-    "textures"
-      / kdl::path_add_extension(Model::BrushFaceAttributes::NoTextureName, ".png"),
-    "textures"
-      / kdl::path_add_extension(Model::BrushFaceAttributes::NoTextureName, ".jpg"),
-    kdl::path_add_extension(Model::BrushFaceAttributes::NoTextureName, ".png"),
-    kdl::path_add_extension(Model::BrushFaceAttributes::NoTextureName, ".jpg"),
-  };
-
-  return kdl::select_first(texturePaths, [&](const auto& texturePath) {
-    return fs.openFile(texturePath).and_then([](auto file) {
-      auto reader = file->reader().buffer();
-      return readFreeImageTexture("", reader);
-    });
+  // load the requested frame
+  loadSceneFrame(*scene, frameIndex, model, modelPath).transform_error([&](auto e) {
+    throw ParserException{
+      fmt::format("Assimp couldn't import model from '{}': {}", m_path.string(), e.msg)};
   });
 }
 
-} // namespace
-
-void AssimpParser::processMaterials(const aiScene& scene, Logger& logger)
-{
-  for (unsigned int i = 0; i < scene.mNumMaterials; i++)
-  {
-    try
-    {
-      // Is there even a single diffuse texture? If not, fail and load fallback material.
-      if (scene.mMaterials[i]->GetTextureCount(aiTextureType_DIFFUSE) == 0)
-      {
-        throw Exception{"Material does not contain a texture."};
-      }
-
-      auto path = aiString{};
-      scene.mMaterials[i]->GetTexture(aiTextureType_DIFFUSE, 0, &path);
-
-      const auto texturePath = std::filesystem::path{path.C_Str()};
-      const auto* texture = scene.GetEmbeddedTexture(path.C_Str());
-      if (!texture)
-      {
-        // The texture is not embedded. Load it using the file system.
-        const auto filePath = m_path.parent_path() / texturePath;
-        m_textures.push_back(loadTextureFromFileSystem(filePath, m_fs, logger));
-      }
-      else if (texture->mHeight != 0)
-      {
-        // The texture is uncompressed, load it directly.
-        m_textures.push_back(loadUncompressedEmbeddedTexture(
-          texture->pcData,
-          texture->mFilename.C_Str(),
-          texture->mWidth,
-          texture->mHeight));
-      }
-      else
-      {
-        // The texture is embedded, but compressed. Let FreeImage load it from memory.
-        m_textures.push_back(loadCompressedEmbeddedTexture(
-          texture->mFilename.C_Str(), texture->pcData, texture->mWidth, m_fs, logger));
-      }
-    }
-    catch (Exception& exception)
-    {
-      // Load fallback material in case we get any error.
-      if (auto fallbackTexture = loadFallbackTexture(m_fs))
-      {
-        m_textures.push_back(std::move(*fallbackTexture));
-      }
-
-      // Materials aren't guaranteed to have a name.
-      const auto materialName = scene.mMaterials[i]->GetName() != aiString{""}
-                                  ? scene.mMaterials[i]->GetName().C_Str()
-                                  : "nr. " + std::to_string(i + 1);
-      logger.error(
-        "Model " + m_path.string() + ": Loading fallback material for material "
-        + materialName + ": " + exception.what());
-    }
-  }
-}
-
-aiMatrix4x4 AssimpParser::get_axis_transform(const aiScene& scene)
-{
-  aiMatrix4x4 matrix = aiMatrix4x4();
-
-  if (scene.mMetaData)
-  {
-    // These MUST be in32_t, or the metadata 'Get' function will get confused.
-    int32_t upAxis = 0, frontAxis = 0, coordAxis = 0, upAxisSign = 0, frontAxisSign = 0,
-            coordAxisSign = 0;
-    float unitScale = 1.0f;
-
-    bool metadataPresent = scene.mMetaData->Get("UpAxis", upAxis)
-                           && scene.mMetaData->Get("UpAxisSign", upAxisSign)
-                           && scene.mMetaData->Get("FrontAxis", frontAxis)
-                           && scene.mMetaData->Get("FrontAxisSign", frontAxisSign)
-                           && scene.mMetaData->Get("CoordAxis", coordAxis)
-                           && scene.mMetaData->Get("CoordAxisSign", coordAxisSign)
-                           && scene.mMetaData->Get("UnitScaleFactor", unitScale);
-
-    if (!metadataPresent)
-    {
-      // By default, all 3D data from is provided in a right-handed coordinate system.
-      // +X to the right. -Z into the screen. +Y upwards.
-      upAxis = 1;
-      upAxisSign = 1;
-      frontAxis = 2;
-      frontAxisSign = 1;
-      coordAxis = 0;
-      coordAxisSign = 1;
-      unitScale = 1.0f;
-    }
-
-    aiVector3D up, front, coord;
-    up[static_cast<unsigned int>(upAxis)] = static_cast<float>(upAxisSign) * unitScale;
-    front[static_cast<unsigned int>(frontAxis)] =
-      static_cast<float>(frontAxisSign) * unitScale;
-    coord[static_cast<unsigned int>(coordAxis)] =
-      static_cast<float>(coordAxisSign) * unitScale;
-
-    matrix = aiMatrix4x4t(
-      coord.x,
-      coord.y,
-      coord.z,
-      0.0f,
-      -front.x,
-      -front.y,
-      -front.z,
-      0.0f,
-      up.x,
-      up.y,
-      up.z,
-      0.0f,
-      0.0f,
-      0.0f,
-      0.0f,
-      1.0f);
-  }
-
-  return matrix;
-}
-
-} // namespace IO
-} // namespace TrenchBroom
+} // namespace TrenchBroom::IO

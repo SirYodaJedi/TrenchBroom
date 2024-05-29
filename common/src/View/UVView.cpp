@@ -49,7 +49,7 @@
 #include "View/UVScaleTool.h"
 #include "View/UVShearTool.h"
 
-#include <kdl/memory_utils.h>
+#include "kdl/memory_utils.h"
 
 #include <cassert>
 #include <memory>
@@ -195,6 +195,7 @@ void UVView::doRender()
     Renderer::RenderContext renderContext(
       Renderer::RenderMode::Render2D, m_camera, fontManager(), shaderManager());
     Renderer::RenderBatch renderBatch(vboManager());
+    renderContext.setDpiScale(static_cast<float>(window()->devicePixelRatioF()));
 
     setupGL(renderContext);
     renderTexture(renderContext, renderBatch);
@@ -310,6 +311,7 @@ private:
       "GridColor",
       vm::vec4f(
         Renderer::gridColorForTexture(texture), 0.6f)); // TODO: make this a preference
+    shader.set("DpiScale", renderContext.dpiScale());
     shader.set("GridScales", scale);
     shader.set("GridMatrix", vm::mat4x4f(toTex));
     shader.set("GridDivider", vm::vec2f(m_helper.subDivisions()));
@@ -414,12 +416,11 @@ Model::PickResult UVView::doPick(const vm::ray3& pickRay) const
   if (!m_helper.valid())
     return pickResult;
 
-  const FloatType distance = m_helper.face()->intersectWithRay(pickRay);
-  if (!vm::is_nan(distance))
+  if (const auto distance = m_helper.face()->intersectWithRay(pickRay))
   {
-    const vm::vec3 hitPoint = vm::point_at_distance(pickRay, distance);
+    const vm::vec3 hitPoint = vm::point_at_distance(pickRay, *distance);
     pickResult.addHit(
-      Model::Hit(UVView::FaceHitType, distance, hitPoint, m_helper.face()));
+      Model::Hit(UVView::FaceHitType, *distance, hitPoint, m_helper.face()));
   }
   return pickResult;
 }

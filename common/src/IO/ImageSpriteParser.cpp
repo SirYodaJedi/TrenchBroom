@@ -27,12 +27,12 @@
 #include "Renderer/IndexRangeMapBuilder.h"
 #include "Renderer/PrimType.h"
 
-#include <kdl/path_utils.h>
-#include <kdl/result.h>
-#include <kdl/string_format.h>
+#include "kdl/path_utils.h"
+#include "kdl/result.h"
+#include "kdl/string_format.h"
 
-#include <vecmath/bbox.h>
-#include <vecmath/vec.h>
+#include "vm/bbox.h"
+#include "vm/vec.h"
 
 #include <vector>
 
@@ -48,9 +48,7 @@ ImageSpriteParser::ImageSpriteParser(
 
 bool ImageSpriteParser::canParse(const std::filesystem::path& path)
 {
-  static const auto extensions =
-    std::vector<std::string>{".png", ".jpg", ".jpeg", ".tga", ".bmp"};
-  return kdl::vec_contains(extensions, kdl::path_to_lower(path.extension()).string());
+  return isSupportedFreeImageExtension(path.extension().string());
 }
 
 std::unique_ptr<Assets::EntityModel> ImageSpriteParser::doInitializeModel(Logger& logger)

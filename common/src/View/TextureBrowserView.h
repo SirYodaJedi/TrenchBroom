@@ -31,30 +31,18 @@
 
 class QScrollBar;
 
-namespace TrenchBroom
-{
-namespace Assets
+namespace TrenchBroom::Assets
 {
 class Texture;
 class TextureCollection;
-} // namespace Assets
+} // namespace TrenchBroom::Assets
 
-namespace View
+namespace TrenchBroom::View
 {
+
 class GLContextManager;
 class MapDocument;
 using TextureGroupData = std::string;
-
-struct TextureCellData
-{
-  const Assets::Texture* texture;
-  std::string mainTitle;
-  std::string subTitle;
-  vm::vec2f mainTitleOffset;
-  vm::vec2f subTitleOffset;
-  Renderer::FontDescriptor mainTitleFont;
-  Renderer::FontDescriptor subTitleFont;
-};
 
 enum class TextureSortOrder
 {
@@ -66,16 +54,13 @@ class TextureBrowserView : public CellView
 {
   Q_OBJECT
 private:
-  using TextVertex = Renderer::GLVertexTypes::P2T2C4::Vertex;
-  using StringMap = std::map<Renderer::FontDescriptor, std::vector<TextVertex>>;
-
   std::weak_ptr<MapDocument> m_document;
-  bool m_group;
-  bool m_hideUnused;
-  TextureSortOrder m_sortOrder;
+  bool m_group = false;
+  bool m_hideUnused = false;
+  TextureSortOrder m_sortOrder = TextureSortOrder::Name;
   std::string m_filterText;
 
-  const Assets::Texture* m_selectedTexture;
+  const Assets::Texture* m_selectedTexture = nullptr;
 
   NotifierConnection m_notifierConnection;
 
@@ -101,24 +86,23 @@ private:
 
   void doInitLayout(Layout& layout) override;
   void doReloadLayout(Layout& layout) override;
-  void addTextureToLayout(
+
+  void addTexturesToLayout(
     Layout& layout,
-    const Assets::Texture* texture,
-    const std::string& groupName,
+    const std::vector<const Assets::Texture*>& textures,
     const Renderer::FontDescriptor& font);
+  void addTextureToLayout(
+    Layout& layout, const Assets::Texture* texture, const Renderer::FontDescriptor& font);
 
-  struct CompareByUsageCount;
-  struct CompareByName;
-  struct MatchUsageCount;
-  struct MatchName;
-
-  const std::vector<Assets::TextureCollection>& getCollections() const;
+  std::vector<const Assets::TextureCollection*> getCollections() const;
   std::vector<const Assets::Texture*> getTextures(
     const Assets::TextureCollection& collection) const;
   std::vector<const Assets::Texture*> getTextures() const;
 
-  void filterTextures(std::vector<const Assets::Texture*>& textures) const;
-  void sortTextures(std::vector<const Assets::Texture*>& textures) const;
+  std::vector<const Assets::Texture*> filterTextures(
+    std::vector<const Assets::Texture*> textures) const;
+  std::vector<const Assets::Texture*> sortTextures(
+    std::vector<const Assets::Texture*> textures) const;
 
   void doClear() override;
   void doRender(Layout& layout, float y, float height) override;
@@ -128,18 +112,14 @@ private:
   void renderBounds(Layout& layout, float y, float height);
   const Color& textureColor(const Assets::Texture& texture) const;
   void renderTextures(Layout& layout, float y, float height);
-  void renderNames(Layout& layout, float y, float height);
-  void renderGroupTitleBackgrounds(Layout& layout, float y, float height);
-  void renderStrings(Layout& layout, float y, float height);
-  StringMap collectStringVertices(Layout& layout, float y, float height);
 
   void doLeftClick(Layout& layout, float x, float y) override;
   QString tooltip(const Cell& cell) override;
   void doContextMenu(Layout& layout, float x, float y, QContextMenuEvent* event) override;
 
-  const TextureCellData& cellData(const Cell& cell) const;
+  const Assets::Texture& cellData(const Cell& cell) const;
 signals:
   void textureSelected(const Assets::Texture* texture);
 };
-} // namespace View
-} // namespace TrenchBroom
+
+} // namespace TrenchBroom::View

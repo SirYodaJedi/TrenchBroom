@@ -73,13 +73,13 @@
 #include "View/SelectionTool.h"
 #include "View/SignalDelayer.h"
 
-#include <kdl/memory_utils.h>
-#include <kdl/string_compare.h>
-#include <kdl/string_format.h>
-#include <kdl/vector_utils.h>
+#include "kdl/memory_utils.h"
+#include "kdl/string_compare.h"
+#include "kdl/string_format.h"
+#include "kdl/vector_utils.h"
 
-#include <vecmath/polygon.h>
-#include <vecmath/util.h>
+#include "vm/polygon.h"
+#include "vm/util.h"
 
 #include <sstream>
 #include <vector>
@@ -1031,6 +1031,7 @@ void MapViewBase::doRender()
   renderContext.setShowFog(pref(Preferences::ShowFog));
   renderContext.setShowGrid(grid.visible());
   renderContext.setGridSize(grid.actualSize());
+  renderContext.setDpiScale(static_cast<float>(window()->devicePixelRatioF()));
   renderContext.setSoftMapBounds(
     pref(Preferences::ShowSoftMapBounds)
       ? vm::bbox3f{document->softMapBounds().bounds.value_or(vm::bbox3{})}
@@ -1258,7 +1259,7 @@ void MapViewBase::showPopupMenuLater()
 
   // Layer operations
 
-  const auto selectedObjectLayers = Model::findContainingLayersUserSorted(nodes);
+  const auto selectedObjectLayers = Model::collectContainingLayersUserSorted(nodes);
 
   auto* moveSelectionTo = menu.addMenu(tr("Move to Layer"));
   for (auto* layerNode : document->world()->allLayersUserSorted())

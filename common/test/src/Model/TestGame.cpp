@@ -19,6 +19,7 @@
 
 #include "TestGame.h"
 
+#include "Assets/EntityDefinition.h"
 #include "Assets/EntityDefinitionFileSpec.h"
 #include "Assets/EntityModel.h"
 #include "Assets/TextureManager.h"
@@ -40,8 +41,8 @@
 #include "Model/WorldNode.h"
 #include "TestUtils.h"
 
-#include <kdl/result.h>
-#include <kdl/string_utils.h>
+#include "kdl/result.h"
+#include "kdl/string_utils.h"
 
 #include <fstream>
 #include <memory>
@@ -169,12 +170,10 @@ std::vector<Node*> TestGame::doParseNodes(
   const std::string& str,
   const MapFormat mapFormat,
   const vm::bbox3& worldBounds,
-  const std::vector<std::string>& linkedGroupsToKeep,
   Logger& /* logger */) const
 {
   IO::TestParserStatus status;
-  return IO::NodeReader::read(
-    str, mapFormat, worldBounds, {}, linkedGroupsToKeep, status);
+  return IO::NodeReader::read(str, mapFormat, worldBounds, {}, status);
 }
 
 std::vector<BrushFace> TestGame::doParseBrushFaces(
@@ -233,8 +232,7 @@ void TestGame::doReloadWads(
   for (const auto& wadPath : wadPaths)
   {
     const auto absoluteWadPath = std::filesystem::current_path() / wadPath;
-    m_fs->mount(
-      "textures" / wadPath.filename(), IO::openFS<IO::WadFileSystem>(absoluteWadPath));
+    m_fs->mount("textures", IO::openFS<IO::WadFileSystem>(absoluteWadPath));
   }
 }
 
@@ -304,11 +302,12 @@ const std::vector<CompilationTool>& TestGame::doCompilationTools() const
   return m_compilationTools;
 }
 
-Result<std::vector<Assets::EntityDefinition*>> TestGame::doLoadEntityDefinitions(
-  IO::ParserStatus& /* status */, const std::filesystem::path& /* path */) const
+Result<std::vector<std::unique_ptr<Assets::EntityDefinition>>> TestGame::
+  loadEntityDefinitions(
+    IO::ParserStatus& /* status */, const std::filesystem::path& /* path */) const
 {
-  return Result<std::vector<Assets::EntityDefinition*>>{
-    std::vector<Assets::EntityDefinition*>{}};
+  return Result<std::vector<std::unique_ptr<Assets::EntityDefinition>>>{
+    std::vector<std::unique_ptr<Assets::EntityDefinition>>{}};
 }
 
 std::unique_ptr<Assets::EntityModel> TestGame::doInitializeModel(

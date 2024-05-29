@@ -26,10 +26,10 @@
 #include "IO/LoadTextureCollection.h"
 #include "Logger.h"
 
-#include <kdl/map_utils.h>
-#include <kdl/result.h>
-#include <kdl/string_format.h>
-#include <kdl/vector_utils.h>
+#include "kdl/map_utils.h"
+#include "kdl/result.h"
+#include "kdl/string_format.h"
+#include "kdl/vector_utils.h"
 
 #include <algorithm>
 #include <chrono>
@@ -213,12 +213,10 @@ void TextureManager::updateTextures()
     for (auto& texture : collection.textures())
     {
       const auto key = kdl::str_to_lower(texture.name());
-      texture.setOverridden(false);
 
       auto mIt = m_texturesByName.find(key);
       if (mIt != m_texturesByName.end())
       {
-        mIt->second->setOverridden(true);
         mIt->second = &texture;
       }
       else
